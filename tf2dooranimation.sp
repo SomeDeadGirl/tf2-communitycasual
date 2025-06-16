@@ -1,25 +1,36 @@
-// you need to connect to the server with "connect ip:port matchmaking"
-
-#pragma semicolon 1
-#pragma newdecls required
-
+#include <sourcemod>
 #include <sdktools>
+#include <sdkhooks>
 
+ConVar g_cvCompetitiveMode;
 Handle gH_RestartTimer = null;
 int gI_RestartTimerIteration = 0;
 
 public Plugin myinfo =
 {
-	name = "TF2 Door Animation Overlay",
-	author = "rtldg",
+	name = "TF2 Casual/Competitive Mode",
+	author = "rtldg (edited by Heapons)",
 	description = "Play the door animation overlay thing with sm_dooranimation.",
-	version = "1.0.0",
-	url = "https://github.com/rtldg/tf2-dooranimation"
+	version = "1.0.1",
+	url = "https://github.com/Heapons/tf2-dooranimation"
 }
 
 public void OnPluginStart()
 {
+	g_cvCompetitiveMode = CreateConVar("sm_competitive_mode", "0", "Toggle Competitive Mode (Door Animation)");
+
 	RegAdminCmd("sm_dooranimation", Command_DoorAnimation, ADMFLAG_RCON, "Shows you the door animation");
+	RegAdminCmd("sm_door", Command_DoorAnimation, ADMFLAG_RCON, "Alias for: sm_dooranimation");
+}
+
+public void OnClientConnected(int client)
+{
+    Event event = CreateEvent("client_beginconnect", true);
+    if (event != null) {
+        event.SetString("source", "matchmaking");
+        event.FireToClient(client);
+        event.Cancel();
+    }
 }
 
 public Action Timer_RestartTime(Handle timer)
@@ -53,7 +64,7 @@ void Frame_RestartTime()
 public Action Command_DoorAnimation(int client, int args)
 {
 	GameRules_SetProp("m_nRoundsPlayed", 0);
-	GameRules_SetProp("m_nMatchGroupType", 7);
+	GameRules_SetProp("m_nMatchGroupType", GetConVarBool(g_cvCompetitiveMode) ? 8 : 7);
 	RequestFrame(Frame_RestartTime);
 	return Plugin_Handled;
 }
