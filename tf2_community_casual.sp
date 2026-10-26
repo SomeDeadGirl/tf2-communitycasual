@@ -43,7 +43,7 @@ enum PostMatchPhase
 
 public Plugin myinfo =
 {
-    name = "[TF2] Community Casual",
+    name = "[TF2] Meet Your Community",
     author = "gloom",
     description = "Adds Meet Your Match's Casual into Community Servers.",
     version = PLUGIN_VERSION,
@@ -1698,7 +1698,7 @@ void PrintVoteStatus(int client)
         ReplyToCommand(client, "[SM] No active map.");
         return;
     }
-    ReplyToCommand(client, "[SM] TF2 Community Casual v%s | countdown_phase=%d | postmatch_phase=%d | map_loaded=%d",
+    ReplyToCommand(client, "[SM] TF2 MYC v%s | countdown_phase=%d | postmatch_phase=%d | map_loaded=%d",
         PLUGIN_VERSION, view_as<int>(g_CountdownPhase), view_as<int>(g_PostMatchPhase), g_bMapRunning);
     char reason[192];
     bool available = PostMatchAvailable(reason, sizeof(reason));
