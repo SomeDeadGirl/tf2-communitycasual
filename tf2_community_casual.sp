@@ -6,8 +6,11 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "1.0.0"
+#define PLUGIN_VERSION "1.1.0"
 #define FINAL_COUNTDOWN_SECONDS 10.0
+#define WARMUP_HANDOFF_SECONDS 11.0
+#define RESPAWN_COUNTDOWN_SECONDS 8.0
+#define DOOR_TRIGGER_SECONDS 10
 #define SPAWN_REDUCTION_SECONDS 30.0
 #define SPAWN_REDUCTION_FLOOR 60.0
 #define CONTROLLER_INTERVAL 0.25
@@ -29,6 +32,7 @@ enum CountdownPhase
 {
     Countdown_None,
     Countdown_Waiting,
+    Countdown_BeforeRespawn,
     Countdown_RestartPending,
     Countdown_Final
 };
@@ -76,6 +80,7 @@ bool g_bHasSpawned[MAXPLAYERS + 1];
 CountdownPhase g_CountdownPhase = Countdown_None;
 float g_flCountdownDeadline;
 float g_flOwnedRestartDeadline;
+float g_flOwnedCountdownDeadline;
 float g_flRestartRequestedAt;
 float g_flNextCountdownMonitorAt;
 Handle g_hCountdownHudRefresh;
@@ -95,6 +100,10 @@ int g_iSavedWaiting;
 int g_iSavedAwaitingReady;
 int g_iSavedRoundsPlayed;
 float g_flSavedCountdownTime;
+int g_iCountdownFreezeSerial[MAXPLAYERS + 1];
+bool g_bCountdownOwnFreezeFlag[MAXPLAYERS + 1];
+MoveType g_CountdownSavedMoveType[MAXPLAYERS + 1];
+float g_flCountdownFrozenAngles[MAXPLAYERS + 1][3];
 
 bool g_bCountdownHudRefreshed[MAXPLAYERS + 1];
 float g_flClientHudReadyAt[MAXPLAYERS + 1];
@@ -298,6 +307,8 @@ public void OnMapStart()
     for (int client = 1; client <= MaxClients; client++)
     {
         g_bHudInitSent[client] = false;
+        g_iCountdownFreezeSerial[client] = 0;
+        g_bCountdownOwnFreezeFlag[client] = false;
         g_hClientHudInit[client] = null;
         g_bCountdownHudRefreshed[client] = false;
         g_flClientHudReadyAt[client] = 0.0;
@@ -340,6 +351,7 @@ public void OnConfigsExecuted()
 
 public void OnMapEnd()
 {
+    ReleaseCountdownPlayers();
     g_bMapRunning = false;
     g_bConfigsReady = false;
     g_iMapSerial++;
@@ -379,6 +391,8 @@ public void OnPluginEnd()
 
 public void OnClientConnected(int client)
 {
+    g_iCountdownFreezeSerial[client] = 0;
+    g_bCountdownOwnFreezeFlag[client] = false;
     ResetClientHudState(client);
     g_bHasSpawned[client] = false;
     g_iPlayerVotes[client] = VOTE_UNDECIDED;
@@ -400,6 +414,7 @@ public void OnClientPostAdminCheck(int client)
 
 public void OnClientDisconnect(int client)
 {
+    ReleaseCountdownPlayer(client);
     ResetClientHudState(client);
     g_bHasSpawned[client] = false;
     g_iPlayerVotes[client] = VOTE_UNDECIDED;
@@ -553,7 +568,9 @@ void ReplayClientMatchPresentation(int client)
         ShowClientMatchSummary(client);
         return;
     }
-    int remaining = RoundToCeil(g_flCountdownDeadline - GetGameTime());
+    bool finalCountdown = g_CountdownPhase == Countdown_BeforeRespawn
+        || g_CountdownPhase == Countdown_RestartPending || g_CountdownPhase == Countdown_Final;
+    int remaining = RoundToCeil((finalCountdown ? g_flOwnedCountdownDeadline : g_flCountdownDeadline) - GetGameTime());
     if (g_CountdownPhase == Countdown_Waiting && remaining > 0)
     {
         Event event = CreateEvent("teamplay_round_restart_seconds", true);
@@ -564,13 +581,13 @@ void ReplayClientMatchPresentation(int client)
             event.Cancel();
         }
     }
-    else if ((g_CountdownPhase == Countdown_Final && g_bCountdownUsesDoors && remaining > 0 && remaining <= 10)
+    else if ((finalCountdown && g_bCountdownUsesDoors && remaining > 0 && remaining <= DOOR_TRIGGER_SECONDS)
         || g_hDoorTickTimer != null)
     {
         Event event = CreateEvent("restart_timer_time", true);
         if (event != null)
         {
-            event.SetInt("time", g_CountdownPhase == Countdown_Final ? remaining : g_iDoorSecondsRemaining);
+            event.SetInt("time", finalCountdown ? remaining : g_iDoorSecondsRemaining);
             event.FireToClient(client);
             event.Cancel();
         }
@@ -618,7 +635,7 @@ public Action Command_Countdown(int client, int args)
     }
     ClearAutomaticCountdownQueue();
     StartCountdown(seconds);
-    ReplyToCommand(client, "[SM] Countdown started: %.0fs. Respawn at 10; play at zero. Cancel: sm_countdown stop.", seconds);
+    ReplyToCommand(client, "[SM] Countdown started: %.0fs. Skip 11; freeze at 10; respawn/unfreeze at 8; play at zero. Cancel: sm_countdown stop.", seconds);
     return Plugin_Handled;
 }
 
@@ -629,7 +646,7 @@ void PrintCountdownStatus(int client)
         ReplyToCommand(client, "[SM] No active map.");
         return;
     }
-    static const char phases[][] = { "idle", "warmup", "respawning", "final ten seconds" };
+    static const char phases[][] = { "idle", "warmup", "before respawn", "respawning", "final countdown" };
     float remaining = g_CountdownPhase != Countdown_None ? g_flCountdownDeadline - GetGameTime() : 0.0;
     ReplyToCommand(client, "[SM] Casual %s | %s | %.1fs left | reductions=%d | held timers=%d",
         PLUGIN_VERSION, phases[view_as<int>(g_CountdownPhase)], remaining, g_iCountdownReductions, g_HeldTimers.Length);
@@ -772,6 +789,7 @@ void StartCountdown(float seconds)
     g_iSavedAwaitingReady = GameRules_GetProp("m_bAwaitingReadyRestart");
     g_iSavedRoundsPlayed = GameRules_GetProp("m_nRoundsPlayed");
     g_flSavedCountdownTime = GameRules_GetPropFloat("m_flCountdownTime");
+    g_flOwnedCountdownDeadline = g_flSavedCountdownTime;
     g_bRoundRestarted = false;
     g_bHoldingPreRound = false;
     g_bCountdownUsesDoors = g_cvDoorsEnabled.BoolValue;
@@ -822,6 +840,10 @@ void StartCountdown(float seconds)
 public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast)
 {
     int client = GetClientOfUserId(event.GetInt("userid"));
+    if (client > 0)
+    {
+        ReleaseCountdownPlayer(client);
+    }
     int team = event.GetInt("team");
     int playerClass = event.GetInt("class");
     if (!g_bMapRunning || client <= 0 || !IsClientInGame(client) || !IsPlayerAlive(client)
@@ -830,6 +852,10 @@ public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast
         return;
     }
 
+    if (g_CountdownPhase == Countdown_BeforeRespawn)
+    {
+        FreezeCountdownPlayer(client);
+    }
     bool firstSpawn = !g_bHasSpawned[client];
     g_bHasSpawned[client] = true;
     QueueClientHudInit(client);
@@ -926,18 +952,33 @@ public void OnGameFrame()
             }
             DisableStopwatch(false);
         }
-        if (now >= g_flCountdownDeadline - FINAL_COUNTDOWN_SECONDS)
+        if (now >= g_flCountdownDeadline - WARMUP_HANDOFF_SECONDS)
         {
             if (!WaitingStateMatches())
             {
                 AbortCountdown("Restart deadline changed before the final countdown.");
                 return;
             }
+            BeginFinalCountdown();
+        }
+    }
+    if (g_CountdownPhase == Countdown_BeforeRespawn)
+    {
+        if (!WaitingStateMatches() || HasPendingRestartRequest()
+            || FloatAbs(GameRules_GetPropFloat("m_flCountdownTime") - g_flOwnedCountdownDeadline) > 0.5)
+        {
+            AbortCountdown("Pre-respawn state or countdown deadline changed externally.");
+            return;
+        }
+        HoldMapTimers();
+        if (now >= g_flCountdownDeadline - RESPAWN_COUNTDOWN_SECONDS)
+        {
             BeginRoundReset();
         }
     }
     else if (g_CountdownPhase == Countdown_RestartPending)
     {
+        HoldMapTimers();
         if (now > g_flRestartRequestedAt + 3.0)
         {
             AbortCountdown("TF2 did not report the requested round reset.");
@@ -964,15 +1005,114 @@ bool WaitingStateMatches()
         && FloatAbs(GameRules_GetPropFloat("m_flRestartRoundTime") - expected) <= 0.5;
 }
 
+void BeginFinalCountdown()
+{
+    CancelCountdownHudRefresh();
+    g_CountdownPhase = Countdown_BeforeRespawn;
+    g_flOwnedRestartDeadline = -1.0;
+    GameRules_SetPropFloat("m_flRestartRoundTime", g_flOwnedRestartDeadline);
+
+    // Skip 11 once. The client receives 10 to start the doors, and the same
+    // deadline carries through the reset at 8 without restarting the animation.
+    g_flCountdownDeadline -= WARMUP_HANDOFF_SECONDS - FINAL_COUNTDOWN_SECONDS;
+    g_flOwnedCountdownDeadline = g_bCountdownUsesDoors ? g_flCountdownDeadline : -1.0;
+    GameRules_SetPropFloat("m_flCountdownTime", g_flOwnedCountdownDeadline);
+    DisableStopwatch(false);
+    HoldMapTimers();
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        FreezeCountdownPlayer(client);
+    }
+}
+
+void FreezeCountdownPlayer(int client)
+{
+    if (!g_bMapRunning || g_CountdownPhase != Countdown_BeforeRespawn
+        || !IsClientInGame(client) || !IsPlayerAlive(client) || GetClientTeam(client) < 2)
+    {
+        return;
+    }
+    int serial = GetClientSerial(client);
+    if (g_iCountdownFreezeSerial[client] == serial)
+    {
+        return;
+    }
+
+    g_iCountdownFreezeSerial[client] = serial;
+    int flags = GetEntityFlags(client);
+    g_bCountdownOwnFreezeFlag[client] = (flags & FL_FROZEN) == 0;
+    g_CountdownSavedMoveType[client] = GetEntityMoveType(client);
+    GetClientEyeAngles(client, g_flCountdownFrozenAngles[client]);
+    SetEntityFlags(client, flags | FL_FROZEN);
+    SetEntityMoveType(client, MOVETYPE_NONE);
+    float stopped[3];
+    TeleportEntity(client, NULL_VECTOR, NULL_VECTOR, stopped);
+}
+
+void ReleaseCountdownPlayer(int client)
+{
+    int serial = g_iCountdownFreezeSerial[client];
+    bool ownFlag = g_bCountdownOwnFreezeFlag[client];
+    g_iCountdownFreezeSerial[client] = 0;
+    g_bCountdownOwnFreezeFlag[client] = false;
+    if (serial == 0 || !g_bMapRunning || !IsClientInGame(client) || GetClientSerial(client) != serial)
+    {
+        return;
+    }
+
+    // Clear only our flag; preserve TF2's intermission freeze and new spawn state.
+    if (ownFlag && GameRules_GetRoundState() != RoundState_GameOver)
+    {
+        SetEntityFlags(client, GetEntityFlags(client) & ~FL_FROZEN);
+    }
+    if (IsPlayerAlive(client) && GetClientTeam(client) >= 2 && GetEntityMoveType(client) == MOVETYPE_NONE)
+    {
+        SetEntityMoveType(client, g_CountdownSavedMoveType[client]);
+    }
+}
+
+void ReleaseCountdownPlayers()
+{
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        ReleaseCountdownPlayer(client);
+    }
+}
+
+public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3], float angles[3], int &weapon)
+{
+    if (g_iCountdownFreezeSerial[client] == 0)
+    {
+        return Plugin_Continue;
+    }
+    if (!g_bMapRunning || (g_CountdownPhase != Countdown_BeforeRespawn && g_CountdownPhase != Countdown_RestartPending)
+        || !IsClientInGame(client) || GetClientSerial(client) != g_iCountdownFreezeSerial[client]
+        || !IsPlayerAlive(client) || GetClientTeam(client) < 2)
+    {
+        ReleaseCountdownPlayer(client);
+        return Plugin_Continue;
+    }
+
+    // FL_FROZEN locks the local camera; command angles also cover bots.
+    buttons = 0;
+    impulse = 0;
+    for (int axis = 0; axis < 3; axis++)
+    {
+        vel[axis] = 0.0;
+        angles[axis] = g_flCountdownFrozenAngles[client][axis];
+    }
+    return Plugin_Changed;
+}
+
 void BeginRoundReset()
 {
-    // Native restart consumes the waiting state and performs the only respawn.
-    CancelCountdownHudRefresh();
+    // Keep TF2's waiting protection until this reset performs the only respawn.
     g_CountdownPhase = Countdown_RestartPending;
     g_flRestartRequestedAt = GetGameTime();
 
     GameRules_SetProp("m_nRoundsPlayed", 0);
-    GameRules_SetPropFloat("m_flCountdownTime", g_bCountdownUsesDoors ? g_flCountdownDeadline : -1.0);
+    g_flOwnedCountdownDeadline = g_bCountdownUsesDoors ? g_flCountdownDeadline : -1.0;
+    GameRules_SetPropFloat("m_flCountdownTime", g_flOwnedCountdownDeadline);
     DisableStopwatch(false);
 
     g_cvReadyMode.SetInt(0);
@@ -1002,6 +1142,7 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
 
     g_bRoundRestarted = true;
     g_CountdownPhase = Countdown_Final;
+    ReleaseCountdownPlayers();
     GameRules_SetProp("m_nRoundsPlayed", 0);
     DisableStopwatch(true);
     HoldMapTimers();
@@ -1023,7 +1164,7 @@ void Frame_HoldFinalCountdown(any serial)
 
     // Run after State_Enter_PREROUND has assigned its own transition time.
     GameRules_SetPropFloat("m_flStateTransitionTime", g_flCountdownDeadline);
-    GameRules_SetPropFloat("m_flCountdownTime", g_bCountdownUsesDoors ? g_flCountdownDeadline : -1.0);
+    GameRules_SetPropFloat("m_flCountdownTime", g_flOwnedCountdownDeadline);
     g_bHoldingPreRound = true;
     DisableStopwatch(true);
     HoldMapTimers();
@@ -1043,6 +1184,7 @@ bool HasPendingRestartRequest()
 
 void FinishCountdown(bool cancelled)
 {
+    ReleaseCountdownPlayers();
     CancelCountdownHudRefresh();
     if (g_CountdownPhase == Countdown_None)
     {
@@ -1059,7 +1201,7 @@ void FinishCountdown(bool cancelled)
         {
             GameRules_SetPropFloat("m_flRestartRoundTime", -1.0);
         }
-        if (FloatAbs(GameRules_GetPropFloat("m_flCountdownTime") - g_flCountdownDeadline) <= 0.5)
+        if (FloatAbs(GameRules_GetPropFloat("m_flCountdownTime") - g_flOwnedCountdownDeadline) <= 0.5)
         {
             GameRules_SetPropFloat("m_flCountdownTime", restoreOriginal ? g_flSavedCountdownTime : -1.0);
         }
@@ -1120,7 +1262,7 @@ bool CanRefreshClientCountdownHud(int client)
 void TickCountdownHudRefresh()
 {
     if (g_CountdownPhase != Countdown_Waiting || g_PostMatchPhase != PostMatch_None
-        || g_bCountdownHudRefresh || g_flCountdownDeadline - GetGameTime() <= FINAL_COUNTDOWN_SECONDS + 2.0)
+        || g_bCountdownHudRefresh || g_flCountdownDeadline - GetGameTime() <= WARMUP_HANDOFF_SECONDS + 2.0)
     {
         return;
     }
@@ -1221,11 +1363,9 @@ public void OnEntityCreated(int entity, const char[] classname)
 
 public void RoundTimer_SpawnPost(int entity)
 {
+    // Spawn starts paused; RoundSpawn and map inputs must initialize it first.
+    // Event_RoundStart/OnGameFrame will hold it after that initialization.
     TrackRoundTimer(entity);
-    if (g_CountdownPhase == Countdown_Final && g_bMapRunning)
-    {
-        HoldRoundTimer(entity);
-    }
 }
 
 void TrackRoundTimer(int entity)
@@ -1493,7 +1633,7 @@ public Action Timer_StartDoors(Handle timer)
     {
         return Plugin_Stop;
     }
-    g_iDoorSecondsRemaining = 10;
+    g_iDoorSecondsRemaining = DOOR_TRIGGER_SECONDS;
     g_hDoorTickTimer = CreateTimer(1.0, Timer_DoorTick, 0,
         TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
     if (g_hDoorTickTimer == null)
