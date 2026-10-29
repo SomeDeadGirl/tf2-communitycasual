@@ -6,7 +6,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "1.1.0"
+#define PLUGIN_VERSION "1.1.1"
 #define FINAL_COUNTDOWN_SECONDS 10.0
 #define WARMUP_HANDOFF_SECONDS 11.0
 #define RESPAWN_COUNTDOWN_SECONDS 8.0
@@ -15,9 +15,6 @@
 #define SPAWN_REDUCTION_FLOOR 60.0
 #define CONTROLLER_INTERVAL 0.25
 #define HUD_INIT_DELAY 1.0
-#define HUD_REFRESH_SETTLE 0.75
-#define HUD_REFRESH_SECONDS 0.75
-#define HUD_REFRESH_COOLDOWN 3.0
 #define TIMER_RECORD_SIZE 2
 #define TIMER_REF 0
 #define TIMER_WAS_RUNNING 1
@@ -83,8 +80,6 @@ float g_flOwnedRestartDeadline;
 float g_flOwnedCountdownDeadline;
 float g_flRestartRequestedAt;
 float g_flNextCountdownMonitorAt;
-Handle g_hCountdownHudRefresh;
-bool g_bCountdownHudRefresh;
 bool g_bRoundRestarted;
 bool g_bHoldingPreRound;
 bool g_bCountdownUsesDoors;
@@ -100,15 +95,8 @@ int g_iSavedWaiting;
 int g_iSavedAwaitingReady;
 int g_iSavedRoundsPlayed;
 float g_flSavedCountdownTime;
-int g_iCountdownFreezeSerial[MAXPLAYERS + 1];
-bool g_bCountdownOwnFreezeFlag[MAXPLAYERS + 1];
-MoveType g_CountdownSavedMoveType[MAXPLAYERS + 1];
-float g_flCountdownFrozenAngles[MAXPLAYERS + 1][3];
+int g_iCountdownMoveLockSerial[MAXPLAYERS + 1];
 
-bool g_bCountdownHudRefreshed[MAXPLAYERS + 1];
-float g_flClientHudReadyAt[MAXPLAYERS + 1];
-int g_iHudRefreshClients[MAXPLAYERS + 1];
-float g_flNextHudRefreshAt;
 bool g_bHudInitSent[MAXPLAYERS + 1];
 Handle g_hClientHudInit[MAXPLAYERS + 1];
 int g_iClientSummaryRun[MAXPLAYERS + 1];
@@ -282,12 +270,9 @@ void RegisterCommandsAndEvents()
 
 public void OnMapStart()
 {
-    g_bCountdownHudRefresh = false;
-    g_hCountdownHudRefresh = null;
     g_bMapRunning = true;
     g_bConfigsReady = false;
     g_bOwnDoorRounds = false;
-    g_flNextHudRefreshAt = 0.0;
     g_iMapSerial++;
     g_bAutoCountdownUsed = false;
     g_bAutoCountdownPending = false;
@@ -307,12 +292,8 @@ public void OnMapStart()
     for (int client = 1; client <= MaxClients; client++)
     {
         g_bHudInitSent[client] = false;
-        g_iCountdownFreezeSerial[client] = 0;
-        g_bCountdownOwnFreezeFlag[client] = false;
+        g_iCountdownMoveLockSerial[client] = 0;
         g_hClientHudInit[client] = null;
-        g_bCountdownHudRefreshed[client] = false;
-        g_flClientHudReadyAt[client] = 0.0;
-        g_iHudRefreshClients[client] = 0;
         g_iClientSummaryRun[client] = 0;
         g_iPlayerVotes[client] = VOTE_UNDECIDED;
 
@@ -360,7 +341,6 @@ public void OnMapEnd()
     g_hDoorTickTimer = null;
     g_hDoorStartTimer = null;
     g_hEndMapTimer = null;
-    g_hCountdownHudRefresh = null;
     for (int client = 1; client <= MaxClients; client++)
     {
         g_hClientHudInit[client] = null;
@@ -391,8 +371,7 @@ public void OnPluginEnd()
 
 public void OnClientConnected(int client)
 {
-    g_iCountdownFreezeSerial[client] = 0;
-    g_bCountdownOwnFreezeFlag[client] = false;
+    g_iCountdownMoveLockSerial[client] = 0;
     ResetClientHudState(client);
     g_bHasSpawned[client] = false;
     g_iPlayerVotes[client] = VOTE_UNDECIDED;
@@ -424,9 +403,6 @@ void ResetClientHudState(int client)
 {
     delete g_hClientHudInit[client];
     g_bHudInitSent[client] = false;
-    g_bCountdownHudRefreshed[client] = false;
-    g_flClientHudReadyAt[client] = 0.0;
-    g_iHudRefreshClients[client] = 0;
     g_iClientSummaryRun[client] = 0;
 }
 
@@ -442,7 +418,6 @@ public Action Timer_Controller(Handle timer)
         return Plugin_Stop;
     }
     TryStartAutomaticCountdown();
-    TickCountdownHudRefresh();
     TickPostMatch();
     TickFinalMatchAudio();
     return Plugin_Continue;
@@ -635,7 +610,7 @@ public Action Command_Countdown(int client, int args)
     }
     ClearAutomaticCountdownQueue();
     StartCountdown(seconds);
-    ReplyToCommand(client, "[SM] Countdown started: %.0fs. Skip 11; freeze at 10; respawn/unfreeze at 8; play at zero. Cancel: sm_countdown stop.", seconds);
+    ReplyToCommand(client, "[SM] Countdown started: %.0fs. Skip 11; block directional input at 10; respawn/release at 8; play at zero. Cancel: sm_countdown stop.", seconds);
     return Plugin_Handled;
 }
 
@@ -650,9 +625,9 @@ void PrintCountdownStatus(int client)
     float remaining = g_CountdownPhase != Countdown_None ? g_flCountdownDeadline - GetGameTime() : 0.0;
     ReplyToCommand(client, "[SM] Casual %s | %s | %.1fs left | reductions=%d | held timers=%d",
         PLUGIN_VERSION, phases[view_as<int>(g_CountdownPhase)], remaining, g_iCountdownReductions, g_HeldTimers.Length);
-    ReplyToCommand(client, "[SM] countdown=%d | start=%.0fs | doors=%d | summary=%d | music=%d | HUD refresh=%d",
+    ReplyToCommand(client, "[SM] countdown=%d | start=%.0fs | doors=%d | summary=%d | music=%d",
         g_cvCountdownEnabled.BoolValue, g_cvCountdownSeconds.FloatValue, g_cvDoorsEnabled.BoolValue,
-        g_cvSummaryEnabled.BoolValue, g_cvMusicEnabled.BoolValue, g_bCountdownHudRefresh);
+        g_cvSummaryEnabled.BoolValue, g_cvMusicEnabled.BoolValue);
 }
 
 void CancelCountdownCommand(int client)
@@ -793,13 +768,6 @@ void StartCountdown(float seconds)
     g_bRoundRestarted = false;
     g_bHoldingPreRound = false;
     g_bCountdownUsesDoors = g_cvDoorsEnabled.BoolValue;
-    g_flNextHudRefreshAt = 0.0;
-    for (int client = 1; client <= MaxClients; client++)
-    {
-        g_bCountdownHudRefreshed[client] = false;
-        g_flClientHudReadyAt[client] = 0.0;
-        g_iHudRefreshClients[client] = 0;
-    }
     g_iCountdownReductions = 0;
     g_HeldTimers.Clear();
     g_PausedStopwatches.Clear();
@@ -854,7 +822,7 @@ public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast
 
     if (g_CountdownPhase == Countdown_BeforeRespawn)
     {
-        FreezeCountdownPlayer(client);
+        LockCountdownMovement(client);
     }
     bool firstSpawn = !g_bHasSpawned[client];
     g_bHasSpawned[client] = true;
@@ -915,10 +883,7 @@ void ReduceCountdownForSpawn()
     }
     g_flCountdownDeadline = deadline;
     g_flOwnedRestartDeadline = deadline;
-    if (!g_bCountdownHudRefresh)
-    {
-        GameRules_SetPropFloat("m_flRestartRoundTime", deadline);
-    }
+    GameRules_SetPropFloat("m_flRestartRoundTime", deadline);
     g_iCountdownReductions++;
 }
 
@@ -998,16 +963,14 @@ public void OnGameFrame()
 
 bool WaitingStateMatches()
 {
-    float expected = g_bCountdownHudRefresh ? -1.0 : g_flOwnedRestartDeadline;
     return g_cvTournament.BoolValue && g_cvReadyMode.BoolValue
         && GameRules_GetProp("m_bInWaitingForPlayers") != 0
         && GameRules_GetProp("m_bAwaitingReadyRestart") == 0
-        && FloatAbs(GameRules_GetPropFloat("m_flRestartRoundTime") - expected) <= 0.5;
+        && FloatAbs(GameRules_GetPropFloat("m_flRestartRoundTime") - g_flOwnedRestartDeadline) <= 0.5;
 }
 
 void BeginFinalCountdown()
 {
-    CancelCountdownHudRefresh();
     g_CountdownPhase = Countdown_BeforeRespawn;
     g_flOwnedRestartDeadline = -1.0;
     GameRules_SetPropFloat("m_flRestartRoundTime", g_flOwnedRestartDeadline);
@@ -1021,54 +984,23 @@ void BeginFinalCountdown()
     HoldMapTimers();
     for (int client = 1; client <= MaxClients; client++)
     {
-        FreezeCountdownPlayer(client);
+        LockCountdownMovement(client);
     }
 }
 
-void FreezeCountdownPlayer(int client)
+void LockCountdownMovement(int client)
 {
     if (!g_bMapRunning || g_CountdownPhase != Countdown_BeforeRespawn
         || !IsClientInGame(client) || !IsPlayerAlive(client) || GetClientTeam(client) < 2)
     {
         return;
     }
-    int serial = GetClientSerial(client);
-    if (g_iCountdownFreezeSerial[client] == serial)
-    {
-        return;
-    }
-
-    g_iCountdownFreezeSerial[client] = serial;
-    int flags = GetEntityFlags(client);
-    g_bCountdownOwnFreezeFlag[client] = (flags & FL_FROZEN) == 0;
-    g_CountdownSavedMoveType[client] = GetEntityMoveType(client);
-    GetClientEyeAngles(client, g_flCountdownFrozenAngles[client]);
-    SetEntityFlags(client, flags | FL_FROZEN);
-    SetEntityMoveType(client, MOVETYPE_NONE);
-    float stopped[3];
-    TeleportEntity(client, NULL_VECTOR, NULL_VECTOR, stopped);
+    g_iCountdownMoveLockSerial[client] = GetClientSerial(client);
 }
 
 void ReleaseCountdownPlayer(int client)
 {
-    int serial = g_iCountdownFreezeSerial[client];
-    bool ownFlag = g_bCountdownOwnFreezeFlag[client];
-    g_iCountdownFreezeSerial[client] = 0;
-    g_bCountdownOwnFreezeFlag[client] = false;
-    if (serial == 0 || !g_bMapRunning || !IsClientInGame(client) || GetClientSerial(client) != serial)
-    {
-        return;
-    }
-
-    // Clear only our flag; preserve TF2's intermission freeze and new spawn state.
-    if (ownFlag && GameRules_GetRoundState() != RoundState_GameOver)
-    {
-        SetEntityFlags(client, GetEntityFlags(client) & ~FL_FROZEN);
-    }
-    if (IsPlayerAlive(client) && GetClientTeam(client) >= 2 && GetEntityMoveType(client) == MOVETYPE_NONE)
-    {
-        SetEntityMoveType(client, g_CountdownSavedMoveType[client]);
-    }
+    g_iCountdownMoveLockSerial[client] = 0;
 }
 
 void ReleaseCountdownPlayers()
@@ -1081,26 +1013,27 @@ void ReleaseCountdownPlayers()
 
 public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3], float angles[3], int &weapon)
 {
-    if (g_iCountdownFreezeSerial[client] == 0)
+    if (g_iCountdownMoveLockSerial[client] == 0)
     {
         return Plugin_Continue;
     }
     if (!g_bMapRunning || (g_CountdownPhase != Countdown_BeforeRespawn && g_CountdownPhase != Countdown_RestartPending)
-        || !IsClientInGame(client) || GetClientSerial(client) != g_iCountdownFreezeSerial[client]
+        || !IsClientInGame(client) || GetClientSerial(client) != g_iCountdownMoveLockSerial[client]
         || !IsPlayerAlive(client) || GetClientTeam(client) < 2)
     {
         ReleaseCountdownPlayer(client);
         return Plugin_Continue;
     }
 
-    // FL_FROZEN locks the local camera; command angles also cover bots.
-    buttons = 0;
-    impulse = 0;
-    for (int axis = 0; axis < 3; axis++)
+    // Filter directional input only; jumping, aiming and physical velocity stay intact.
+    int movementButtons = IN_FORWARD | IN_BACK | IN_MOVELEFT | IN_MOVERIGHT;
+    if ((buttons & movementButtons) == 0 && vel[0] == 0.0 && vel[1] == 0.0)
     {
-        vel[axis] = 0.0;
-        angles[axis] = g_flCountdownFrozenAngles[client][axis];
+        return Plugin_Continue;
     }
+    buttons &= ~movementButtons;
+    vel[0] = 0.0;
+    vel[1] = 0.0;
     return Plugin_Changed;
 }
 
@@ -1185,7 +1118,6 @@ bool HasPendingRestartRequest()
 void FinishCountdown(bool cancelled)
 {
     ReleaseCountdownPlayers();
-    CancelCountdownHudRefresh();
     if (g_CountdownPhase == Countdown_None)
     {
         return;
@@ -1250,107 +1182,6 @@ void AbortCountdown(const char[] reason)
     }
     FinishCountdown(true);
     DebugChatAll("[SM] Countdown interrupted. Held timers were released.");
-}
-
-bool CanRefreshClientCountdownHud(int client)
-{
-    return IsClientInGame(client) && !IsFakeClient(client) && g_bHudInitSent[client]
-        && IsPlayerAlive(client) && GetClientTeam(client) >= 2
-        && GetEntProp(client, Prop_Send, "m_iClass") > 0;
-}
-
-void TickCountdownHudRefresh()
-{
-    if (g_CountdownPhase != Countdown_Waiting || g_PostMatchPhase != PostMatch_None
-        || g_bCountdownHudRefresh || g_flCountdownDeadline - GetGameTime() <= WARMUP_HANDOFF_SECONDS + 2.0)
-    {
-        return;
-    }
-    float now = GetGameTime();
-    bool due = false;
-    for (int client = 1; client <= MaxClients; client++)
-    {
-        if (g_bCountdownHudRefreshed[client] || !CanRefreshClientCountdownHud(client))
-        {
-            g_flClientHudReadyAt[client] = 0.0;
-            continue;
-        }
-        if (g_flClientHudReadyAt[client] == 0.0)
-        {
-            g_flClientHudReadyAt[client] = now + HUD_REFRESH_SETTLE;
-        }
-        if (g_flClientHudReadyAt[client] <= now)
-        {
-            due = true;
-        }
-    }
-    if (!due || now < g_flNextHudRefreshAt || !WaitingStateMatches() || HasPendingRestartRequest()
-        || GameRules_GetPropFloat("m_flCountdownTime") > now)
-    {
-        return;
-    }
-    g_hCountdownHudRefresh = CreateTimer(HUD_REFRESH_SECONDS, Timer_RestoreCountdownHud,
-        g_iCountdownSerial, TIMER_FLAG_NO_MAPCHANGE);
-    if (g_hCountdownHudRefresh == null)
-    {
-        return;
-    }
-    for (int client = 1; client <= MaxClients; client++)
-    {
-        g_iHudRefreshClients[client] = g_flClientHudReadyAt[client] > 0.0
-            && g_flClientHudReadyAt[client] <= now && CanRefreshClientCountdownHud(client)
-            ? GetClientSerial(client) : 0;
-    }
-    g_bCountdownHudRefresh = true;
-    g_flNextHudRefreshAt = now + HUD_REFRESH_COOLDOWN;
-    // Pulse the native visibility flag; the logical deadline keeps advancing.
-    // Negative time cannot trigger TF2's positive-expired-time restart path.
-    GameRules_SetPropFloat("m_flRestartRoundTime", -1.0);
-}
-
-public Action Timer_RestoreCountdownHud(Handle timer, any serial)
-{
-    if (timer != g_hCountdownHudRefresh)
-    {
-        return Plugin_Stop;
-    }
-    g_hCountdownHudRefresh = null;
-    if (!g_bMapRunning || serial != g_iCountdownSerial
-        || g_CountdownPhase != Countdown_Waiting || !g_bCountdownHudRefresh)
-    {
-        g_bCountdownHudRefresh = false;
-        return Plugin_Stop;
-    }
-    if (!WaitingStateMatches() || HasPendingRestartRequest()
-        || FloatAbs(GameRules_GetPropFloat("m_flRestartRoundTime") + 1.0) > 0.01)
-    {
-        AbortCountdown("Native waiting/restart state changed during the countdown HUD refresh.");
-        return Plugin_Stop;
-    }
-
-    // Restore the latest deadline, including spawns during the pulse; never add time.
-    GameRules_SetPropFloat("m_flRestartRoundTime", g_flOwnedRestartDeadline);
-    g_bCountdownHudRefresh = false;
-    for (int client = 1; client <= MaxClients; client++)
-    {
-        if (g_iHudRefreshClients[client] != 0 && CanRefreshClientCountdownHud(client)
-            && GetClientSerial(client) == g_iHudRefreshClients[client])
-        {
-            g_bCountdownHudRefreshed[client] = true;
-        }
-        g_iHudRefreshClients[client] = 0;
-    }
-    return Plugin_Stop;
-}
-
-void CancelCountdownHudRefresh()
-{
-    delete g_hCountdownHudRefresh;
-    g_bCountdownHudRefresh = false;
-    for (int client = 1; client <= MaxClients; client++)
-    {
-        g_iHudRefreshClients[client] = 0;
-    }
 }
 
 public void OnEntityCreated(int entity, const char[] classname)
