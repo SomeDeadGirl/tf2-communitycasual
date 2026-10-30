@@ -6,10 +6,13 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "1.1.1"
+#define PLUGIN_VERSION "1.1.3"
 #define FINAL_COUNTDOWN_SECONDS 10.0
 #define WARMUP_HANDOFF_SECONDS 11.0
 #define RESPAWN_COUNTDOWN_SECONDS 8.0
+#define BATTLECRY_DELAY_SECONDS 5.0
+#define BATTLECRY_GAP_MIN 0.3
+#define BATTLECRY_GAP_MAX 0.5
 #define DOOR_TRIGGER_SECONDS 10
 #define SPAWN_REDUCTION_SECONDS 30.0
 #define SPAWN_REDUCTION_FLOOR 60.0
@@ -40,6 +43,16 @@ enum PostMatchPhase
     PostMatch_Queued,
     PostMatch_Voting,
     PostMatch_Chosen
+};
+
+enum
+{
+    Battlecry_Entity,
+    Battlecry_Client,
+    Battlecry_Team,
+    Battlecry_Class,
+    Battlecry_Paused,
+    Battlecry_RecordSize
 };
 
 public Plugin myinfo =
@@ -96,6 +109,9 @@ int g_iSavedAwaitingReady;
 int g_iSavedRoundsPlayed;
 float g_flSavedCountdownTime;
 int g_iCountdownMoveLockSerial[MAXPLAYERS + 1];
+ArrayList g_DelayedBattlecries;
+bool g_bCaptureBattlecries;
+float g_flBattlecryReleaseAt;
 
 bool g_bHudInitSent[MAXPLAYERS + 1];
 Handle g_hClientHudInit[MAXPLAYERS + 1];
@@ -162,6 +178,7 @@ public void OnPluginStart()
     g_QueuedSpawnClients = new ArrayList();
     g_RoundTimers = new ArrayList();
     g_MapSchemaIds = new StringMap();
+    g_DelayedBattlecries = new ArrayList(Battlecry_RecordSize);
     CreatePluginConVars();
     RegisterCommandsAndEvents();
     AutoExecConfig(true, "tf2_casual_countdown");
@@ -252,6 +269,7 @@ void RegisterCommandsAndEvents()
     AddCommandListener(Command_NextMapVote, "next_map_vote");
 
     HookEvent("teamplay_round_start", Event_RoundStart, EventHookMode_PostNoCopy);
+    HookEvent("teamplay_round_active", Event_RoundActive, EventHookMode_PostNoCopy);
     HookEvent("player_spawn", Event_PlayerSpawn, EventHookMode_Post);
     HookEventEx("teamplay_game_over", Event_GameOver, EventHookMode_Pre);
     HookEventEx("tf_game_over", Event_GameOver, EventHookMode_Pre);
@@ -270,6 +288,9 @@ void RegisterCommandsAndEvents()
 
 public void OnMapStart()
 {
+    g_DelayedBattlecries.Clear();
+    g_bCaptureBattlecries = false;
+    g_flBattlecryReleaseAt = 0.0;
     g_bMapRunning = true;
     g_bConfigsReady = false;
     g_bOwnDoorRounds = false;
@@ -332,6 +353,7 @@ public void OnConfigsExecuted()
 
 public void OnMapEnd()
 {
+    ReleaseCountdownBattlecries(false);
     ReleaseCountdownPlayers();
     g_bMapRunning = false;
     g_bConfigsReady = false;
@@ -367,6 +389,7 @@ public void OnPluginEnd()
     delete g_QueuedSpawnClients;
     delete g_RoundTimers;
     delete g_MapSchemaIds;
+    delete g_DelayedBattlecries;
 }
 
 public void OnClientConnected(int client)
@@ -393,6 +416,7 @@ public void OnClientPostAdminCheck(int client)
 
 public void OnClientDisconnect(int client)
 {
+    CancelClientBattlecries(client);
     ReleaseCountdownPlayer(client);
     ResetClientHudState(client);
     g_bHasSpawned[client] = false;
@@ -755,6 +779,7 @@ bool CanStartCountdown(bool automatic, char[] reason, int maxlen)
 
 void StartCountdown(float seconds)
 {
+    ReleaseCountdownBattlecries(false);
     StopStandaloneDoors();
     g_iSavedTournament = g_cvTournament.IntValue;
     g_iSavedReadyMode = g_cvReadyMode.IntValue;
@@ -810,6 +835,7 @@ public void Event_PlayerSpawn(Event event, const char[] name, bool dontBroadcast
     int client = GetClientOfUserId(event.GetInt("userid"));
     if (client > 0)
     {
+        CancelClientBattlecries(client);
         ReleaseCountdownPlayer(client);
     }
     int team = event.GetInt("team");
@@ -893,6 +919,7 @@ public void OnGameFrame()
     {
         return;
     }
+    TickCountdownBattlecries();
     if (g_CountdownPhase == Countdown_None)
     {
         return;
@@ -1056,6 +1083,7 @@ void BeginRoundReset()
 
 public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
 {
+    ReleaseCountdownBattlecries(false);
     StopStandaloneDoors(false);
     if (g_PostMatchPhase == PostMatch_None)
     {
@@ -1099,6 +1127,8 @@ void Frame_HoldFinalCountdown(any serial)
     GameRules_SetPropFloat("m_flStateTransitionTime", g_flCountdownDeadline);
     GameRules_SetPropFloat("m_flCountdownTime", g_flOwnedCountdownDeadline);
     g_bHoldingPreRound = true;
+    g_bCaptureBattlecries = g_bCountdownUsesDoors;
+    g_flBattlecryReleaseAt = g_bCountdownUsesDoors ? g_flCountdownDeadline + BATTLECRY_DELAY_SECONDS : 0.0;
     DisableStopwatch(true);
     HoldMapTimers();
 }
@@ -1117,6 +1147,10 @@ bool HasPendingRestartRequest()
 
 void FinishCountdown(bool cancelled)
 {
+    if (cancelled)
+    {
+        ReleaseCountdownBattlecries(false);
+    }
     ReleaseCountdownPlayers();
     if (g_CountdownPhase == Countdown_None)
     {
@@ -1189,6 +1223,191 @@ public void OnEntityCreated(int entity, const char[] classname)
     if (g_RoundTimers != null && StrEqual(classname, "team_round_timer"))
     {
         SDKHook(entity, SDKHook_SpawnPost, RoundTimer_SpawnPost);
+    }
+    else if (g_bCaptureBattlecries && g_bMapRunning && StrEqual(classname, "instanced_scripted_scene")
+        && GameRules_GetRoundState() == RoundState_RoundRunning)
+    {
+        SDKHook(entity, SDKHook_SpawnPost, Battlecry_SpawnPost);
+    }
+}
+
+public void Event_RoundActive(Event event, const char[] name, bool dontBroadcast)
+{
+    // TF2 creates its automatic round-start speech before this event.
+    g_bCaptureBattlecries = false;
+}
+
+public void Battlecry_SpawnPost(int entity)
+{
+    SDKUnhook(entity, SDKHook_SpawnPost, Battlecry_SpawnPost);
+    if (!g_bCaptureBattlecries || GetGameTime() >= g_flBattlecryReleaseAt
+        || !HasEntProp(entity, Prop_Data, "m_hOwner") || !HasEntProp(entity, Prop_Send, "m_bPaused"))
+    {
+        return;
+    }
+    int client = GetEntPropEnt(entity, Prop_Data, "m_hOwner");
+    if (client <= 0 || client > MaxClients || !IsClientInGame(client)
+        || !IsPlayerAlive(client) || GetClientTeam(client) < 2)
+    {
+        return;
+    }
+
+    int record[Battlecry_RecordSize];
+    record[Battlecry_Entity] = EntIndexToEntRef(entity);
+    record[Battlecry_Client] = GetClientSerial(client);
+    record[Battlecry_Team] = GetClientTeam(client);
+    record[Battlecry_Class] = GetEntProp(client, Prop_Send, "m_iClass");
+    g_DelayedBattlecries.PushArray(record, sizeof(record));
+    HookSingleEntityOutput(entity, "OnStart", Battlecry_OnStart, true);
+}
+
+public void Battlecry_OnStart(const char[] output, int caller, int activator, float delay)
+{
+    int index = g_DelayedBattlecries.FindValue(EntIndexToEntRef(caller), Battlecry_Entity);
+    if (index == -1 || !g_bMapRunning)
+    {
+        return;
+    }
+    int record[Battlecry_RecordSize];
+    g_DelayedBattlecries.GetArray(index, record, sizeof(record));
+    // Pause before the first scene tick, preserving TF2's voice choice and recipients.
+    if (AcceptEntityInput(caller, "Pause"))
+    {
+        record[Battlecry_Paused] = 1;
+        g_DelayedBattlecries.SetArray(index, record, sizeof(record));
+    }
+    else
+    {
+        g_DelayedBattlecries.Erase(index);
+        LogError("Could not pause an automatic battlecry scene.");
+    }
+}
+
+void TickCountdownBattlecries()
+{
+    if (g_flBattlecryReleaseAt <= 0.0)
+    {
+        return;
+    }
+    RoundState state = GameRules_GetRoundState();
+    if (g_PostMatchPhase != PostMatch_None
+        || (state != RoundState_Preround && state != RoundState_RoundRunning))
+    {
+        ReleaseCountdownBattlecries(false);
+    }
+    else if (GetGameTime() >= g_flBattlecryReleaseAt)
+    {
+        if (state != RoundState_RoundRunning)
+        {
+            ReleaseCountdownBattlecries(false);
+            return;
+        }
+        bool played = PlayNextCountdownBattlecry();
+        if (g_DelayedBattlecries.Length == 0)
+        {
+            ReleaseCountdownBattlecries(false);
+        }
+        else if (played)
+        {
+            // Space actual releases so a slow server frame cannot bunch up the queue.
+            g_flBattlecryReleaseAt = GetGameTime() + GetRandomFloat(BATTLECRY_GAP_MIN, BATTLECRY_GAP_MAX);
+        }
+    }
+}
+
+bool IsCountdownBattlecryValid(const int record[Battlecry_RecordSize])
+{
+    int entity = EntRefToEntIndex(record[Battlecry_Entity]);
+    int client = GetClientFromSerial(record[Battlecry_Client]);
+    return entity != INVALID_ENT_REFERENCE && g_bMapRunning && client > 0
+        && IsClientInGame(client) && IsPlayerAlive(client)
+        && GetClientTeam(client) == record[Battlecry_Team]
+        && GetEntProp(client, Prop_Send, "m_iClass") == record[Battlecry_Class]
+        && GetEntPropEnt(entity, Prop_Data, "m_hOwner") == client
+        && (record[Battlecry_Paused] == 0 || GetEntProp(entity, Prop_Send, "m_bIsPlayingBack") != 0);
+}
+
+bool PlayNextCountdownBattlecry()
+{
+    for (int i = g_DelayedBattlecries.Length - 1; i >= 0; i--)
+    {
+        int record[Battlecry_RecordSize];
+        g_DelayedBattlecries.GetArray(i, record, sizeof(record));
+        if (!IsCountdownBattlecryValid(record))
+        {
+            ReleaseCountdownBattlecry(i, false);
+        }
+    }
+    if (g_DelayedBattlecries.Length == 0)
+    {
+        return false;
+    }
+
+    int serial = g_DelayedBattlecries.Get(0, Battlecry_Client);
+    for (int i = 0; i < g_DelayedBattlecries.Length; i++)
+    {
+        if (g_DelayedBattlecries.Get(i, Battlecry_Client) == serial
+            && g_DelayedBattlecries.Get(i, Battlecry_Paused) == 0)
+        {
+            return false;
+        }
+    }
+
+    // A disguised Spy can have two recipient-specific scenes for the same line.
+    bool played = false;
+    for (int i = g_DelayedBattlecries.Length - 1; i >= 0; i--)
+    {
+        if (g_DelayedBattlecries.Get(i, Battlecry_Client) == serial)
+        {
+            played = ReleaseCountdownBattlecry(i, true) || played;
+        }
+    }
+    return played;
+}
+
+bool ReleaseCountdownBattlecry(int index, bool play)
+{
+    int record[Battlecry_RecordSize];
+    g_DelayedBattlecries.GetArray(index, record, sizeof(record));
+    g_DelayedBattlecries.Erase(index);
+    int entity = EntRefToEntIndex(record[Battlecry_Entity]);
+    if (entity == INVALID_ENT_REFERENCE)
+    {
+        return false;
+    }
+    UnhookSingleEntityOutput(entity, "OnStart", Battlecry_OnStart);
+    if (!play || !IsCountdownBattlecryValid(record))
+    {
+        RemoveEntity(entity);
+        return false;
+    }
+    return record[Battlecry_Paused] != 0 && AcceptEntityInput(entity, "Resume");
+}
+
+void ReleaseCountdownBattlecries(bool play)
+{
+    g_bCaptureBattlecries = false;
+    g_flBattlecryReleaseAt = 0.0;
+    if (g_DelayedBattlecries == null)
+    {
+        return;
+    }
+    for (int i = g_DelayedBattlecries.Length - 1; i >= 0; i--)
+    {
+        ReleaseCountdownBattlecry(i, play);
+    }
+}
+
+void CancelClientBattlecries(int client)
+{
+    int serial = GetClientSerial(client);
+    for (int i = g_DelayedBattlecries.Length - 1; i >= 0; i--)
+    {
+        if (g_DelayedBattlecries.Get(i, Battlecry_Client) != serial)
+        {
+            continue;
+        }
+        ReleaseCountdownBattlecry(i, false);
     }
 }
 
